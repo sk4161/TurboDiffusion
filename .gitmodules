@@ -1,3 +1,6 @@
 [submodule "turbodiffusion/ops/cutlass"]
 	path = turbodiffusion/ops/cutlass
 	url = https://github.com/NVIDIA/cutlass
+[submodule "co-tracker"]
+	path = co-tracker
+	url = https://github.com/facebookresearch/co-tracker.git
