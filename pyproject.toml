@@ -50,6 +50,10 @@ requires = [
 ]
 build-backend = "setuptools.build_meta"
 
+[tool.uv.extra-build-dependencies]
+fvcore = ["setuptools"]
+flash-attn = ["torch", "setuptools", "packaging"]
+
 [project.scripts]
 turbodiffusion-serve = "turbodiffusion.serve.tui:main"
 
