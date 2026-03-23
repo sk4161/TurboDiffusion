@@ -68,7 +68,7 @@ def parse_arguments() -> argparse.Namespace:
 
 
 def _save_track_vis(video, tracks_np, vis_np, save_path, fps=16):
-    """Save a video with tracked points drawn on each frame.
+    """Save a video with tracked points drawn on each frame (PIL-based).
 
     Args:
         video: (T, 3, H, W) float32 in [0, 1]
@@ -76,20 +76,21 @@ def _save_track_vis(video, tracks_np, vis_np, save_path, fps=16):
         vis_np: (T, N) float32 — visibility scores
         save_path: output .mp4 path
     """
-    import cv2
+    from PIL import ImageDraw
     T, C, H, W = video.shape
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(save_path, fourcc, fps, (W, H))
+    frames = []
     for t in range(T):
-        frame = (video[t].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        frame = Image.fromarray((video[t].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
+        draw = ImageDraw.Draw(frame)
         for n in range(tracks_np.shape[1]):
             if vis_np[t, n] > 0.5:
-                x, y = int(tracks_np[t, n, 0]), int(tracks_np[t, n, 1])
+                x, y = float(tracks_np[t, n, 0]), float(tracks_np[t, n, 1])
                 if 0 <= x < W and 0 <= y < H:
-                    cv2.circle(frame_bgr, (x, y), 2, (0, 255, 0), -1)
-        out.write(frame_bgr)
-    out.release()
+                    draw.ellipse([x - 2, y - 2, x + 2, y + 2], fill=(0, 255, 0))
+        frames.append(np.array(frame))
+    frames_tensor = torch.from_numpy(np.stack(frames)).float() / 255.0  # (T, H, W, 3)
+    frames_tensor = frames_tensor.permute(3, 0, 1, 2).unsqueeze(0)  # (1, 3, T, H, W)
+    save_image_or_video(rearrange(frames_tensor, "b c t h w -> c t h w"), save_path, fps=fps)
 
 
 def denoise_one_step(x, t_cur, t_next, net, condition, generator=None):
