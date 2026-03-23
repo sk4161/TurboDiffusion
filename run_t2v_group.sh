@@ -1,5 +1,5 @@
 #!/bin/bash
-export PYTHONPATH=turbodiffusion
+export PYTHONPATH=turbodiffusion:.
 
 PROMPT="A orange tabby cat in motion on a rocky ledge, fur catching warm golden hour light, tail raised high, coastal cliffs and shimmering blue sea stretching into the background, shallow depth of field, photorealistic, 8k wildlife photography"
 
