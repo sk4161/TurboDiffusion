@@ -15,6 +15,7 @@
 
 import argparse
 import math
+import os
 
 import torch
 from einops import rearrange, repeat
@@ -60,7 +61,42 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--quant_linear", action="store_true", help="Whether to replace Linear layers with quantized versions")
     parser.add_argument("--default_norm", action="store_true", help="Whether to replace LayerNorm/RMSNorm layers with faster versions")
     parser.add_argument("--serve", action="store_true", help="Launch interactive TUI server mode (keeps model loaded)")
+    # Group inference arguments
+    parser.add_argument("--group_inference", action="store_true", help="Enable group inference with diversity-based pruning")
+    parser.add_argument("--starting_candidates", type=int, default=8, help="Number of initial candidate videos (different seeds)")
+    parser.add_argument("--output_group_size", type=int, default=4, help="Number of diverse videos to output")
+    parser.add_argument("--pruning_steps", type=str, default="2", help="Comma-separated denoising step indices at which to prune (0-indexed)")
+    parser.add_argument("--pruning_ratio", type=float, default=0.5, help="Fraction of candidates to drop at each pruning step")
+    parser.add_argument("--brush_mask", type=str, default=None, help="Path to foreground mask for tracking query points")
+    parser.add_argument("--cotracker_checkpoint", type=str, default="checkpoints/scaled_offline.pth", help="Path to CoTracker3 checkpoint")
+    parser.add_argument("--guidance_grid_size", type=int, default=10, help="Grid spacing for foreground query points")
     return parser.parse_args()
+
+
+def denoise_one_step(x, t_cur, t_next, net, condition, ode, generator=None):
+    """Run one denoising step, return (next_x, x0_pred)."""
+    ones = torch.ones(x.size(0), 1, device=x.device, dtype=x.dtype)
+    with torch.no_grad():
+        v_pred = net(
+            x_B_C_T_H_W=x.to(**tensor_kwargs),
+            timesteps_B_T=(t_cur.float() * ones * 1000).to(**tensor_kwargs),
+            **condition,
+        ).to(torch.float64)
+
+        # x0 prediction: x_t = (1-t)*x0 + t*noise, v = noise - x0
+        # => x0 = x_t - t * v
+        x0_pred = x - t_cur * v_pred
+
+        if ode:
+            next_x = x - (t_cur - t_next) * v_pred
+        else:
+            next_x = (1 - t_next) * x0_pred + t_next * torch.randn(
+                *x.shape,
+                dtype=torch.float32,
+                device=x.device,
+                generator=generator,
+            )
+    return next_x, x0_pred
 
 
 if __name__ == "__main__":
@@ -68,7 +104,6 @@ if __name__ == "__main__":
 
     # Handle serve mode
     if args.serve:
-        # Set mode to i2v for the TUI server
         args.mode = "i2v"
         from serve.tui import main as serve_main
         serve_main(args)
@@ -142,7 +177,7 @@ if __name__ == "__main__":
             [image_tensor.unsqueeze(2), torch.zeros(1, 3, F - 1, h, w, device=image_tensor.device)], dim=2
         )  # -> B, C, T, H, W
         encoded_latents = tokenizer.encode(frames_to_encode)  # -> B, C_lat, T_lat, H_lat, W_lat
-        
+
         del frames_to_encode
         torch.cuda.empty_cache()
 
@@ -155,68 +190,214 @@ if __name__ == "__main__":
     log.info(f"Generating with prompt: {args.prompt}")
     condition = {"crossattn_emb": repeat(text_emb.to(**tensor_kwargs), "b l d -> (k b) l d", k=args.num_samples), "y_B_C_T_H_W": y}
 
-    to_show = []
-
     state_shape = [tokenizer.latent_ch, lat_t, lat_h, lat_w]
 
-    generator = torch.Generator(device=tensor_kwargs["device"])
-    generator.manual_seed(args.seed)
-
-    init_noise = torch.randn(
-        args.num_samples,
-        *state_shape,
-        dtype=torch.float32,
-        device=tensor_kwargs["device"],
-        generator=generator,
-    )
-
     mid_t = [1.5, 1.4, 1.0][: args.num_steps - 1]
-
     t_steps = torch.tensor(
         [math.atan(args.sigma_max), *mid_t, 0],
         dtype=torch.float64,
-        device=init_noise.device,
+        device=tensor_kwargs["device"],
     )
-
     # Convert TrigFlow timesteps to RectifiedFlow
     t_steps = torch.sin(t_steps) / (torch.cos(t_steps) + torch.sin(t_steps))
-
-    x = init_noise.to(torch.float64) * t_steps[0]
-    ones = torch.ones(x.size(0), 1, device=x.device, dtype=x.dtype)
     total_steps = t_steps.shape[0] - 1
-    high_noise_model.cuda()
-    net = high_noise_model
-    switched = False
-    for i, (t_cur, t_next) in enumerate(tqdm(list(zip(t_steps[:-1], t_steps[1:])), desc="Sampling", total=total_steps)):
-        if t_cur.item() < args.boundary and not switched:
-            high_noise_model.cpu()
-            torch.cuda.empty_cache()
-            low_noise_model.cuda()
-            net = low_noise_model
-            switched = True
-            log.info("Switched to low noise model.")
-        with torch.no_grad():
-            v_pred = net(x_B_C_T_H_W=x.to(**tensor_kwargs), timesteps_B_T=(t_cur.float() * ones * 1000).to(**tensor_kwargs), **condition).to(
-                torch.float64
-            )
-            if args.ode:
-                x = x - (t_cur - t_next) * v_pred
-            else:
-                x = (1 - t_next) * (x - t_cur * v_pred) + t_next * torch.randn(
-                    *x.shape,
-                    dtype=torch.float32,
-                    device=tensor_kwargs["device"],
-                    generator=generator,
+
+    # =========================================================================
+    # Standard (non-group) inference
+    # =========================================================================
+    if not args.group_inference:
+        generator = torch.Generator(device=tensor_kwargs["device"])
+        generator.manual_seed(args.seed)
+
+        init_noise = torch.randn(
+            args.num_samples, *state_shape,
+            dtype=torch.float32, device=tensor_kwargs["device"], generator=generator,
+        )
+        x = init_noise.to(torch.float64) * t_steps[0]
+        ones = torch.ones(x.size(0), 1, device=x.device, dtype=x.dtype)
+
+        high_noise_model.cuda()
+        net = high_noise_model
+        switched = False
+        for i, (t_cur, t_next) in enumerate(tqdm(list(zip(t_steps[:-1], t_steps[1:])), desc="Sampling", total=total_steps)):
+            if t_cur.item() < args.boundary and not switched:
+                high_noise_model.cpu()
+                torch.cuda.empty_cache()
+                low_noise_model.cuda()
+                net = low_noise_model
+                switched = True
+                log.info("Switched to low noise model.")
+            with torch.no_grad():
+                v_pred = net(x_B_C_T_H_W=x.to(**tensor_kwargs), timesteps_B_T=(t_cur.float() * ones * 1000).to(**tensor_kwargs), **condition).to(
+                    torch.float64
                 )
-    samples = x.float()
-    low_noise_model.cpu()
-    torch.cuda.empty_cache()
+                if args.ode:
+                    x = x - (t_cur - t_next) * v_pred
+                else:
+                    x = (1 - t_next) * (x - t_cur * v_pred) + t_next * torch.randn(
+                        *x.shape, dtype=torch.float32, device=tensor_kwargs["device"], generator=generator,
+                    )
+        samples = x.float()
+        low_noise_model.cpu()
+        torch.cuda.empty_cache()
 
-    with torch.no_grad():
-        video = tokenizer.decode(samples)
+        with torch.no_grad():
+            video = tokenizer.decode(samples)
 
-    to_show.append(video.float().cpu())
+        to_show = [(1.0 + video.float().cpu().clamp(-1, 1)) / 2.0]
+        to_show = torch.stack(to_show, dim=0)
+        save_image_or_video(rearrange(to_show, "n b c t h w -> c t (n h) (b w)"), args.save_path, fps=16)
 
-    to_show = (1.0 + torch.stack(to_show, dim=0).clamp(-1, 1)) / 2.0
+    # =========================================================================
+    # Group inference with trajectory diversity pruning
+    # =========================================================================
+    else:
+        from motion_guidance import (
+            CoTrackerEstimator,
+            build_foreground_queries,
+            decode_to_video,
+            trajectory_pairwise_distance,
+            greedy_diverse_select,
+            get_next_size,
+        )
 
-    save_image_or_video(rearrange(to_show, "n b c t h w -> c t (n h) (b w)"), args.save_path, fps=16)
+        pruning_step_set = set(int(s) for s in args.pruning_steps.split(","))
+        N = args.starting_candidates
+        K = args.output_group_size
+
+        log.info(f"Group inference: {N} candidates -> {K} outputs, pruning at steps {pruning_step_set}")
+
+        # Prepare CoTracker queries from foreground mask
+        tracker = None
+        queries = None
+        if args.brush_mask:
+            # Use CoTracker resolution for tracking
+            track_h, track_w = 384, 512
+            queries = build_foreground_queries(args.brush_mask, track_h, track_w, grid_size=args.guidance_grid_size)
+            tracker = CoTrackerEstimator(checkpoint_path=args.cotracker_checkpoint)
+            log.info(f"Built {queries.shape[1]} foreground query points from mask.")
+        else:
+            log.warning("No --brush_mask provided. Pruning will use full-frame tracking grid.")
+            # Build a uniform grid over the whole frame
+            track_h, track_w = 384, 512
+            grid_size = args.guidance_grid_size
+            xs = np.arange(grid_size // 2, track_w, grid_size)
+            ys = np.arange(grid_size // 2, track_h, grid_size)
+            gx, gy = np.meshgrid(xs, ys)
+            gx, gy = gx.flatten(), gy.flatten()
+            queries = torch.zeros(1, len(gx), 3, dtype=torch.float32)
+            queries[0, :, 1] = torch.from_numpy(gx.astype(np.float32))
+            queries[0, :, 2] = torch.from_numpy(gy.astype(np.float32))
+            tracker = CoTrackerEstimator(checkpoint_path=args.cotracker_checkpoint)
+            log.info(f"Built {queries.shape[1]} uniform query points (no mask).")
+
+        # Generate N initial noise samples with different seeds
+        l_generators = []
+        l_latents = []
+        for cand_idx in range(N):
+            gen = torch.Generator(device=tensor_kwargs["device"])
+            gen.manual_seed(args.seed + cand_idx)
+            noise = torch.randn(
+                args.num_samples, *state_shape,
+                dtype=torch.float32, device=tensor_kwargs["device"], generator=gen,
+            )
+            l_latents.append(noise.to(torch.float64) * t_steps[0])
+            l_generators.append(gen)
+
+        log.info(f"Initialized {N} candidate latents.")
+
+        # Denoising loop with progressive pruning
+        high_noise_model.cuda()
+        net = high_noise_model
+        switched = False
+
+        for step_idx, (t_cur, t_next) in enumerate(tqdm(list(zip(t_steps[:-1], t_steps[1:])), desc="Sampling", total=total_steps)):
+            # Model switching
+            if t_cur.item() < args.boundary and not switched:
+                high_noise_model.cpu()
+                torch.cuda.empty_cache()
+                low_noise_model.cuda()
+                net = low_noise_model
+                switched = True
+                log.info("Switched to low noise model.")
+
+            # Denoise each candidate
+            next_latents = []
+            x0_preds = []
+            for cand_idx, x in enumerate(l_latents):
+                next_x, x0_pred = denoise_one_step(
+                    x, t_cur, t_next, net, condition, args.ode,
+                    generator=l_generators[cand_idx],
+                )
+                next_latents.append(next_x)
+                x0_preds.append(x0_pred)
+
+            # Pruning step: select diverse subset based on trajectory distance
+            curr_size = len(next_latents)
+            if step_idx in pruning_step_set and curr_size > K and tracker is not None:
+                next_size = get_next_size(curr_size, K, 1 - args.pruning_ratio)
+                log.info(f"Step {step_idx}: pruning {curr_size} -> {next_size} candidates")
+
+                # Offload DiT to free VRAM for VAE + CoTracker
+                if switched:
+                    low_noise_model.cpu()
+                else:
+                    high_noise_model.cpu()
+                torch.cuda.empty_cache()
+
+                # Decode x0 predictions and track
+                all_tracks = []
+                for cand_idx, x0 in enumerate(x0_preds):
+                    video = decode_to_video(x0.float(), tokenizer, target_h=track_h, target_w=track_w)
+                    tracks, vis = tracker.track(video, queries)
+                    all_tracks.append(tracks.cpu())
+                    del video
+                    torch.cuda.empty_cache()
+
+                # Compute pairwise trajectory distance
+                D = trajectory_pairwise_distance(all_tracks, track_h, track_w)
+                log.info(f"Pairwise distance matrix:\n{np.array2string(D, precision=4)}")
+
+                # Select diverse subset
+                selected = greedy_diverse_select(D, next_size)
+                log.info(f"Selected candidates: {selected}")
+
+                # Prune
+                next_latents = [next_latents[i] for i in selected]
+                x0_preds = [x0_preds[i] for i in selected]
+                l_generators = [l_generators[i] for i in selected]
+
+                del all_tracks
+                tracker.to_cpu()
+                torch.cuda.empty_cache()
+
+                # Reload DiT
+                if switched:
+                    low_noise_model.cuda()
+                else:
+                    high_noise_model.cuda()
+
+            l_latents = next_latents
+
+        # Offload DiT
+        if switched:
+            low_noise_model.cpu()
+        else:
+            high_noise_model.cpu()
+        torch.cuda.empty_cache()
+
+        # Decode final candidates
+        log.info(f"Decoding {len(l_latents)} final videos...")
+        os.makedirs(os.path.dirname(args.save_path) or ".", exist_ok=True)
+
+        for cand_idx, latent in enumerate(l_latents):
+            with torch.no_grad():
+                video = tokenizer.decode(latent.float())
+            video_show = (1.0 + video.float().cpu().clamp(-1, 1)) / 2.0
+            save_path = f"{args.save_path}_{cand_idx}.mp4"
+            save_image_or_video(rearrange(video_show, "b c t h w -> c t h (b w)"), save_path, fps=16)
+            log.success(f"Saved candidate {cand_idx} to {save_path}")
+            del video
+            torch.cuda.empty_cache()
+
+        log.success(f"Group inference complete. {len(l_latents)} diverse videos saved.")
