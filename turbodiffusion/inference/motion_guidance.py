@@ -56,28 +56,40 @@ class CoTrackerEstimator:
 # ---------------------------------------------------------------------------
 
 class SAM2Segmenter:
-    """Auto-segment the largest object in a frame using SAM2 (transformers)."""
+    """Segment an object in a frame using Grounding DINO + SAM2.
 
-    def __init__(self, model_name="facebook/sam2-hiera-base-plus"):
-        self._model_name = model_name
-        self._pipe = None
+    When text_prompt is given, Grounding DINO detects bounding boxes and
+    SAM2 segments within them. Falls back to largest-mask auto-segmentation
+    if no boxes are found.
+    """
+
+    def __init__(self, text_prompt, sam2_model="facebook/sam2-hiera-base-plus",
+                 gdino_model="IDEA-Research/grounding-dino-tiny", box_threshold=0.3):
+        self._text_prompt = text_prompt
+        self._sam2_model = sam2_model
+        self._gdino_model = gdino_model
+        self._box_threshold = box_threshold
+        self._gdino = None
+        self._gdino_proc = None
+        self._sam2_pipe = None
 
     def _ensure_loaded(self):
-        if self._pipe is None:
-            from transformers import pipeline as hf_pipeline
-            self._pipe = hf_pipeline(
-                "mask-generation",
-                model=self._model_name,
-                device="cuda" if torch.cuda.is_available() else "cpu",
-            )
+        if self._gdino is None:
+            from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection, pipeline as hf_pipeline
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            self._gdino_proc = AutoProcessor.from_pretrained(self._gdino_model)
+            self._gdino = AutoModelForZeroShotObjectDetection.from_pretrained(self._gdino_model).to(device)
+            self._sam2_pipe = hf_pipeline("mask-generation", model=self._sam2_model, device=device)
 
     def to_cpu(self):
-        if self._pipe is not None:
-            self._pipe.model.cpu()
-            torch.cuda.empty_cache()
+        if self._gdino is not None:
+            self._gdino.cpu()
+        if self._sam2_pipe is not None:
+            self._sam2_pipe.model.cpu()
+        torch.cuda.empty_cache()
 
     def get_fg_mask(self, frame_uint8):
-        """Get foreground mask for the dominant object.
+        """Detect text_prompt object and return its segmentation mask.
 
         Args:
             frame_uint8: (H, W, 3) numpy uint8 array
@@ -85,16 +97,37 @@ class SAM2Segmenter:
             mask: (H, W) boolean numpy array
         """
         self._ensure_loaded()
+        device = next(self._gdino.parameters()).device
         pil_img = Image.fromarray(frame_uint8)
-        outputs = self._pipe(pil_img, points_per_batch=64)
-        masks = outputs["masks"]  # list of (H, W) bool arrays
 
+        # Grounding DINO: detect bounding boxes from text
+        inputs = self._gdino_proc(images=pil_img, text=self._text_prompt, return_tensors="pt").to(device)
+        with torch.no_grad():
+            outputs = self._gdino(**inputs)
+        results = self._gdino_proc.post_process_grounded_object_detection(
+            outputs, inputs.input_ids,
+            threshold=self._box_threshold,
+            target_sizes=[pil_img.size[::-1]],
+        )[0]
+
+        boxes = results["boxes"].cpu().numpy()  # (N, 4) xyxy
+
+        if len(boxes) == 0:
+            # Fallback: auto-segmentation, pick largest mask
+            out = self._sam2_pipe(pil_img, points_per_batch=64)
+            masks = out["masks"]
+            if not masks:
+                return np.ones(frame_uint8.shape[:2], dtype=bool)
+            return masks[int(np.argmax([m.sum() for m in masks]))]
+
+        # SAM2: segment using detected boxes (use highest-confidence box)
+        scores = results["scores"].cpu().numpy()
+        best_box = boxes[scores.argmax()].tolist()  # [x1, y1, x2, y2]
+        out = self._sam2_pipe(pil_img, input_boxes=[[best_box]])
+        masks = out["masks"]
         if not masks:
             return np.ones(frame_uint8.shape[:2], dtype=bool)
-
-        # Pick largest mask
-        best = masks[int(np.argmax([m.sum() for m in masks]))]
-        return best
+        return masks[int(np.argmax([m.sum() for m in masks]))]
 
 
 # ---------------------------------------------------------------------------

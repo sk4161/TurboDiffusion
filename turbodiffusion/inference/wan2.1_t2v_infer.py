@@ -62,6 +62,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--pruning_steps", type=str, default="2", help="Comma-separated denoising step indices at which to prune (0-indexed)")
     parser.add_argument("--pruning_ratio", type=float, default=0.5, help="Fraction of candidates to drop at each pruning step")
     parser.add_argument("--sam2_model", type=str, default="facebook/sam2-hiera-base-plus", help="SAM2 model name (HuggingFace)")
+    parser.add_argument("--seg_prompt", type=str, default="cat", help="Text prompt for Grounding DINO object detection")
     parser.add_argument("--cotracker_checkpoint", type=str, default="checkpoints/scaled_offline.pth", help="Path to CoTracker3 checkpoint")
     parser.add_argument("--guidance_grid_size", type=int, default=10, help="Grid spacing for object query points")
     return parser.parse_args()
@@ -90,7 +91,7 @@ def _save_track_vis(video, tracks_np, vis_np, save_path, fps=16):
         frames.append(np.array(frame))
     frames_tensor = torch.from_numpy(np.stack(frames)).float() / 255.0  # (T, H, W, 3)
     frames_tensor = frames_tensor.permute(3, 0, 1, 2).unsqueeze(0)  # (1, 3, T, H, W)
-    save_image_or_video(rearrange(frames_tensor, "b c t h w -> c t h w"), save_path, fps=fps)
+    save_image_or_video(rearrange(frames_tensor, "1 c t h w -> c t h w"), save_path, fps=fps)
 
 
 def denoise_one_step(x, t_cur, t_next, net, condition, generator=None):
@@ -216,7 +217,7 @@ if __name__ == "__main__":
         log.info(f"Group inference: {N} candidates -> {K} outputs, pruning at steps {pruning_step_set}")
 
         # Lazy-load SAM3 and CoTracker (only instantiate objects; weights load on first use)
-        segmenter = SAM2Segmenter(model_name=args.sam2_model)
+        segmenter = SAM2Segmenter(text_prompt=args.seg_prompt, sam2_model=args.sam2_model)
         tracker = CoTrackerEstimator(checkpoint_path=args.cotracker_checkpoint)
         track_h, track_w = 384, 512
 
