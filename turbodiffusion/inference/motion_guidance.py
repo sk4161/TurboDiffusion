@@ -262,6 +262,32 @@ def trajectory_pairwise_distance(all_tracks, video_h=384, video_w=512):
     return D
 
 
+def trajectory_pairwise_distance_i2v(all_tracks, video_h=384, video_w=512):
+    """Compute pairwise track distance for I2V (same scene, point correspondence valid).
+
+    Normalizes track positions by resolution and computes mean L2 distance
+    across all tracked points and frames.
+
+    Args:
+        all_tracks: list of (1, T, N, 2) track tensors
+        video_h, video_w: frame resolution for normalization
+    Returns:
+        D: (N_cand, N_cand) numpy array, upper triangular
+    """
+    N_cand = len(all_tracks)
+    D = np.zeros((N_cand, N_cand))
+    scale = np.array([video_w, video_h], dtype=np.float32)
+
+    tracks_norm = [t[0].float().numpy() / scale for t in all_tracks]  # each (T, N, 2)
+
+    for i in range(N_cand):
+        for j in range(i + 1, N_cand):
+            diff = tracks_norm[i] - tracks_norm[j]  # (T, N, 2)
+            D[i, j] = float(np.sqrt((diff ** 2).sum(axis=-1)).mean())
+
+    return D
+
+
 # ---------------------------------------------------------------------------
 # Subset selection
 # ---------------------------------------------------------------------------

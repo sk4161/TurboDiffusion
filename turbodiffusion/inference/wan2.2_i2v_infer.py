@@ -315,7 +315,7 @@ if __name__ == "__main__":
             CoTrackerEstimator,
             build_foreground_queries,
             decode_to_video,
-            trajectory_pairwise_distance,
+            trajectory_pairwise_distance_i2v,
             greedy_diverse_select,
             get_next_size,
         )
@@ -417,7 +417,7 @@ if __name__ == "__main__":
                     torch.cuda.empty_cache()
 
                 # Compute pairwise trajectory distance
-                D = trajectory_pairwise_distance(all_tracks, track_h, track_w)
+                D = trajectory_pairwise_distance_i2v(all_tracks, track_h, track_w)
                 log.info(f"Pairwise distance matrix:\n{np.array2string(D, precision=4)}")
 
                 # Save debug outputs
