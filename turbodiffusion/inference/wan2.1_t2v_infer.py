@@ -82,6 +82,39 @@ def _extract_subject(prompt):
     return text.strip()
 
 
+def _save_histogram_plots(all_tracks, video_h, video_w, save_dir, bins=16):
+    """Save 2D motion displacement histogram plots for each candidate."""
+    import matplotlib.pyplot as plt
+
+    n_cand = len(all_tracks)
+    fig, axes = plt.subplots(1, n_cand, figsize=(4 * n_cand, 4))
+    if n_cand == 1:
+        axes = [axes]
+
+    for cand_idx, tracks in enumerate(all_tracks):
+        t = tracks[0].float()  # (T, N, 2)
+        disp = t[1:] - t[:-1]
+        dx = disp[..., 0].reshape(-1).numpy() / video_w
+        dy = disp[..., 1].reshape(-1).numpy() / video_h
+        disp_np = disp.numpy()
+        dx -= np.repeat(np.median(disp_np[..., 0], axis=1), disp_np.shape[1])
+        dy -= np.repeat(np.median(disp_np[..., 1], axis=1), disp_np.shape[1])
+
+        h, xedges, yedges = np.histogram2d(dx, dy, bins=bins, range=[[-0.5, 0.5], [-0.5, 0.5]])
+        ax = axes[cand_idx]
+        im = ax.imshow(h.T, origin="lower", aspect="auto",
+                       extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
+                       cmap="hot")
+        ax.set_title(f"cand {cand_idx:02d}")
+        ax.set_xlabel("dx")
+        ax.set_ylabel("dy")
+        plt.colorbar(im, ax=ax)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "motion_histograms.png"), dpi=150)
+    plt.close()
+
+
 def _save_track_vis(video, tracks_np, vis_np, save_path, fps=16):
     """Save a video with tracked points drawn on each frame (PIL-based).
 
@@ -274,7 +307,6 @@ if __name__ == "__main__":
                 os.makedirs(debug_dir, exist_ok=True)
 
                 all_tracks = []
-                all_masks = []
                 for cand_idx, x0 in enumerate(x0_preds):
                     # Decode x0 to video at tracking resolution
                     video = decode_to_video(x0.float(), tokenizer, target_h=track_h, target_w=track_w)
@@ -301,9 +333,10 @@ if __name__ == "__main__":
                     torch.cuda.empty_cache()
 
                 # Compute pairwise diversity and select
-                D = trajectory_pairwise_distance(all_tracks, use_displacement=True)
+                D = trajectory_pairwise_distance(all_tracks, video_h=track_h, video_w=track_w)
                 log.info(f"Pairwise distance matrix:\n{np.array2string(D, precision=4)}")
                 np.save(os.path.join(debug_dir, "distance_matrix.npy"), D)
+                _save_histogram_plots(all_tracks, track_h, track_w, debug_dir)
                 selected = greedy_diverse_select(D, next_size)
                 log.info(f"Selected candidates: {selected}")
 

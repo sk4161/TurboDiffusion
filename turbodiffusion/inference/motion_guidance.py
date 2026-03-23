@@ -213,32 +213,51 @@ def decode_to_video(latents, tokenizer, target_h=384, target_w=512):
 # Diversity scoring
 # ---------------------------------------------------------------------------
 
-def trajectory_pairwise_distance(all_tracks, use_displacement=True):
-    """Compute pairwise trajectory distance matrix (upper triangular).
+def _motion_histogram(tracks, video_h, video_w, bins=16):
+    """Compute a 2D histogram of motion displacement vectors.
+
+    Args:
+        tracks: (T, N, 2) float tensor, pixel coordinates
+        video_h, video_w: frame resolution for normalization
+    Returns:
+        hist: (bins*bins,) normalized numpy array
+    """
+    # Frame-to-frame displacement, normalized to [-1, 1]
+    disp = tracks[1:] - tracks[:-1]  # (T-1, N, 2)
+    dx = disp[..., 0].reshape(-1).numpy() / video_w  # normalize
+    dy = disp[..., 1].reshape(-1).numpy() / video_h
+
+    # Camera motion compensation: subtract median displacement per frame
+    disp_np = disp.numpy()  # (T-1, N, 2)
+    dx -= np.median(disp_np[..., 0], axis=1).repeat(disp_np.shape[1])
+    dy -= np.median(disp_np[..., 1], axis=1).repeat(disp_np.shape[1])
+
+    hist, _, _ = np.histogram2d(dx, dy, bins=bins, range=[[-0.5, 0.5], [-0.5, 0.5]])
+    hist = hist / (hist.sum() + 1e-8)  # normalize
+    return hist.flatten()
+
+
+def trajectory_pairwise_distance(all_tracks, video_h=384, video_w=512):
+    """Compute pairwise motion distribution distance (upper triangular).
+
+    Uses 2D displacement histograms — no spatial correspondence required,
+    suitable for T2V where different candidates have different content.
 
     Args:
         all_tracks: list of (1, T, N, 2) track tensors
-        use_displacement: if True, measure displacement (relative motion) —
-                          recommended for T2V where objects start at different positions
+        video_h, video_w: frame resolution for normalization
     Returns:
         D: (N_cand, N_cand) numpy array, upper triangular
     """
     N_cand = len(all_tracks)
     D = np.zeros((N_cand, N_cand))
-    tracks = [t[0].float() for t in all_tracks]  # list of (T, N, 2)
 
-    if use_displacement:
-        tracks = [t - t[0:1] for t in tracks]  # zero-origin displacement
-
-    # Subtract per-frame mean displacement (camera motion compensation)
-    tracks = [t - t.mean(dim=1, keepdim=True) for t in tracks]  # (T, N, 2) - mean over N
+    hists = [_motion_histogram(t[0].float(), video_h, video_w) for t in all_tracks]
 
     for i in range(N_cand):
         for j in range(i + 1, N_cand):
-            n = min(tracks[i].shape[1], tracks[j].shape[1])
-            diff = tracks[i][:, :n] - tracks[j][:, :n]
-            dist = (diff ** 2).sum(dim=-1).sqrt().mean().item()
-            D[i, j] = dist
+            # L2 distance between normalized histograms
+            D[i, j] = float(np.linalg.norm(hists[i] - hists[j]))
 
     return D
 
