@@ -62,10 +62,24 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--pruning_steps", type=str, default="2", help="Comma-separated denoising step indices at which to prune (0-indexed)")
     parser.add_argument("--pruning_ratio", type=float, default=0.5, help="Fraction of candidates to drop at each pruning step")
     parser.add_argument("--sam2_model", type=str, default="facebook/sam2-hiera-base-plus", help="SAM2 model name (HuggingFace)")
-    parser.add_argument("--seg_prompt", type=str, default="cat", help="Text prompt for Grounding DINO object detection")
+    parser.add_argument("--seg_prompt", type=str, default=None, help="Text prompt for Grounding DINO object detection (defaults to generation prompt)")
     parser.add_argument("--cotracker_checkpoint", type=str, default="checkpoints/scaled_offline.pth", help="Path to CoTracker3 checkpoint")
     parser.add_argument("--guidance_grid_size", type=int, default=10, help="Grid spacing for object query points")
     return parser.parse_args()
+
+
+def _extract_subject(prompt):
+    """Extract the subject noun phrase from a generation prompt.
+
+    "A orange tabby cat in motion on a rocky ledge, ..."
+    -> "orange tabby cat"
+    """
+    import re
+    # Remove leading article (A/An/The)
+    text = re.sub(r"^(a|an|the)\s+", "", prompt.strip(), flags=re.IGNORECASE)
+    # Cut at first preposition or comma
+    text = re.split(r"\s+(in|on|with|at|near|under|over|by|of|,)", text, maxsplit=1)[0]
+    return text.strip()
 
 
 def _save_track_vis(video, tracks_np, vis_np, save_path, fps=16):
@@ -201,7 +215,6 @@ if __name__ == "__main__":
     # =========================================================================
     else:
         from motion_guidance import (
-            SAM2Segmenter,
             CoTrackerEstimator,
             build_queries_from_mask,
             decode_to_video,
@@ -217,7 +230,6 @@ if __name__ == "__main__":
         log.info(f"Group inference: {N} candidates -> {K} outputs, pruning at steps {pruning_step_set}")
 
         # Lazy-load SAM3 and CoTracker (only instantiate objects; weights load on first use)
-        segmenter = SAM2Segmenter(text_prompt=args.seg_prompt, sam2_model=args.sam2_model)
         tracker = CoTrackerEstimator(checkpoint_path=args.cotracker_checkpoint)
         track_h, track_w = 384, 512
 
@@ -267,19 +279,12 @@ if __name__ == "__main__":
                     # Decode x0 to video at tracking resolution
                     video = decode_to_video(x0.float(), tokenizer, target_h=track_h, target_w=track_w)
 
-                    # First frame for SAM2 object detection (H, W, 3) uint8
-                    frame0 = (video[0, 0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-                    mask = segmenter.get_fg_mask(frame0)
-                    all_masks.append(mask)
-
-                    # Save SAM2 mask: overlay on first frame
-                    mask_vis = frame0.copy()
-                    mask_vis[mask] = (mask_vis[mask] * 0.5 + np.array([0, 200, 0]) * 0.5).astype(np.uint8)
-                    Image.fromarray(mask_vis).save(os.path.join(debug_dir, f"cand{cand_idx:02d}_mask.png"))
-
-                    # Build queries and track
-                    queries = build_queries_from_mask(mask, track_h, track_w, grid_size=args.guidance_grid_size)
-                    log.info(f"  Candidate {cand_idx}: {queries.shape[1]} query points from SAM2 mask")
+                    # Uniform grid queries over the full frame
+                    queries = build_queries_from_mask(
+                        np.ones((track_h, track_w), dtype=bool), track_h, track_w,
+                        grid_size=args.guidance_grid_size,
+                    )
+                    log.info(f"  Candidate {cand_idx}: {queries.shape[1]} uniform grid query points")
 
                     tracks, vis = tracker.track(video, queries)
                     tracks_np = tracks[0].cpu().numpy()  # (T, N, 2)
@@ -307,7 +312,6 @@ if __name__ == "__main__":
                 l_generators = [l_generators[i] for i in selected]
 
                 del all_tracks
-                segmenter.to_cpu()
                 tracker.to_cpu()
 
                 # Reload DiT

@@ -64,7 +64,7 @@ class SAM2Segmenter:
     """
 
     def __init__(self, text_prompt, sam2_model="facebook/sam2-hiera-base-plus",
-                 gdino_model="IDEA-Research/grounding-dino-tiny", box_threshold=0.3):
+                 gdino_model="IDEA-Research/grounding-dino-tiny", box_threshold=0.15):
         self._text_prompt = text_prompt
         self._sam2_model = sam2_model
         self._gdino_model = gdino_model
@@ -113,12 +113,20 @@ class SAM2Segmenter:
         boxes = results["boxes"].cpu().numpy()  # (N, 4) xyxy
 
         if len(boxes) == 0:
-            # Fallback: auto-segmentation, pick largest mask
-            out = self._sam2_pipe(pil_img, points_per_batch=64)
+            # Fallback: SAM2 with center point prompt
+            H, W = frame_uint8.shape[:2]
+            out = self._sam2_pipe(pil_img, input_points=[[[W // 2, H // 2]]], input_labels=[[1]])
             masks = out["masks"]
             if not masks:
                 return np.ones(frame_uint8.shape[:2], dtype=bool)
-            return masks[int(np.argmax([m.sum() for m in masks]))]
+            # Pick mask closest to center (smallest distance from centroid to center)
+            cx, cy = W / 2, H / 2
+            def center_dist(m):
+                ys, xs = np.where(m)
+                if len(xs) == 0:
+                    return float("inf")
+                return ((xs.mean() - cx) ** 2 + (ys.mean() - cy) ** 2) ** 0.5
+            return masks[int(np.argmin([center_dist(m) for m in masks]))]
 
         # SAM2: segment using detected boxes (use highest-confidence box)
         scores = results["scores"].cpu().numpy()
@@ -222,9 +230,11 @@ def trajectory_pairwise_distance(all_tracks, use_displacement=True):
     if use_displacement:
         tracks = [t - t[0:1] for t in tracks]  # zero-origin displacement
 
+    # Subtract per-frame mean displacement (camera motion compensation)
+    tracks = [t - t.mean(dim=1, keepdim=True) for t in tracks]  # (T, N, 2) - mean over N
+
     for i in range(N_cand):
         for j in range(i + 1, N_cand):
-            # Align query counts in case SAM3 gave different numbers of points
             n = min(tracks[i].shape[1], tracks[j].shape[1])
             diff = tracks[i][:, :n] - tracks[j][:, :n]
             dist = (diff ** 2).sum(dim=-1).sqrt().mean().item()

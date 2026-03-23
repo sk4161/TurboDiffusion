@@ -19,7 +19,5 @@ python turbodiffusion/inference/wan2.1_t2v_infer.py \
     --output_group_size 4 \
     --pruning_steps 2 \
     --pruning_ratio 0.5 \
-    --sam2_model facebook/sam2-hiera-base-plus \
-    --seg_prompt "cat" \
     --cotracker_checkpoint checkpoints/scaled_offline.pth \
     --guidance_grid_size 10
