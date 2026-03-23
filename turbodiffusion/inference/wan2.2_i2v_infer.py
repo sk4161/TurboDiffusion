@@ -36,6 +36,65 @@ from modify_model import tensor_kwargs, create_model
 torch._dynamo.config.suppress_errors = True
 
 
+def _save_histogram_plots(all_tracks, video_h, video_w, save_dir, bins=16):
+    """Save 2D motion displacement histogram plots for each candidate."""
+    import matplotlib.pyplot as plt
+
+    n_cand = len(all_tracks)
+    fig, axes = plt.subplots(1, n_cand, figsize=(4 * n_cand, 4))
+    if n_cand == 1:
+        axes = [axes]
+
+    for cand_idx, tracks in enumerate(all_tracks):
+        t = tracks[0].float()  # (T, N, 2)
+        disp = t[1:] - t[:-1]
+        dx = disp[..., 0].reshape(-1).numpy() / video_w
+        dy = disp[..., 1].reshape(-1).numpy() / video_h
+        disp_np = disp.numpy()
+        dx -= np.repeat(np.median(disp_np[..., 0], axis=1), disp_np.shape[1])
+        dy -= np.repeat(np.median(disp_np[..., 1], axis=1), disp_np.shape[1])
+
+        h, xedges, yedges = np.histogram2d(dx, dy, bins=bins, range=[[-0.5, 0.5], [-0.5, 0.5]])
+        ax = axes[cand_idx]
+        im = ax.imshow(h.T, origin="lower", aspect="auto",
+                       extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
+                       cmap="hot")
+        ax.set_title(f"cand {cand_idx:02d}")
+        ax.set_xlabel("dx")
+        ax.set_ylabel("dy")
+        plt.colorbar(im, ax=ax)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "motion_histograms.png"), dpi=150)
+    plt.close()
+
+
+def _save_track_vis(video, tracks_np, vis_np, save_path, fps=16):
+    """Save a video with tracked points drawn on each frame (PIL-based).
+
+    Args:
+        video: (T, 3, H, W) float32 in [0, 1]
+        tracks_np: (T, N, 2) float32 — (x, y) positions
+        vis_np: (T, N) float32 — visibility scores
+        save_path: output .mp4 path
+    """
+    from PIL import ImageDraw
+    T, C, H, W = video.shape
+    frames = []
+    for t in range(T):
+        frame = Image.fromarray((video[t].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
+        draw = ImageDraw.Draw(frame)
+        for n in range(tracks_np.shape[1]):
+            if vis_np[t, n] > 0.5:
+                x, y = float(tracks_np[t, n, 0]), float(tracks_np[t, n, 1])
+                if 0 <= x < W and 0 <= y < H:
+                    draw.ellipse([x - 2, y - 2, x + 2, y + 2], fill=(0, 255, 0))
+        frames.append(np.array(frame))
+    frames_tensor = torch.from_numpy(np.stack(frames)).float() / 255.0  # (T, H, W, 3)
+    frames_tensor = frames_tensor.permute(3, 0, 1, 2).unsqueeze(0)  # (1, 3, T, H, W)
+    save_image_or_video(rearrange(frames_tensor, "1 c t h w -> c t h w"), save_path, fps=fps)
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="TurboDiffusion inference script for Wan2.2 I2V with High/Low Noise models")
     parser.add_argument("--image_path", type=str, default=None, help="Path to the input image (required unless --serve)")
@@ -347,16 +406,35 @@ if __name__ == "__main__":
 
                 # Decode x0 predictions and track
                 all_tracks = []
+                all_vis = []
+                all_videos = []
                 for cand_idx, x0 in enumerate(x0_preds):
                     video = decode_to_video(x0.float(), tokenizer, target_h=track_h, target_w=track_w)
                     tracks, vis = tracker.track(video, queries)
                     all_tracks.append(tracks.cpu())
-                    del video
+                    all_vis.append(vis.cpu())
+                    all_videos.append(video.cpu())
                     torch.cuda.empty_cache()
 
                 # Compute pairwise trajectory distance
                 D = trajectory_pairwise_distance(all_tracks, track_h, track_w)
                 log.info(f"Pairwise distance matrix:\n{np.array2string(D, precision=4)}")
+
+                # Save debug outputs
+                debug_dir = os.path.join(os.path.dirname(args.save_path) or ".", f"debug_step{step_idx}")
+                os.makedirs(debug_dir, exist_ok=True)
+                np.save(os.path.join(debug_dir, "distance_matrix.npy"), D)
+                _save_histogram_plots(all_tracks, track_h, track_w, debug_dir)
+                for cand_idx, (tracks, vis, video) in enumerate(zip(all_tracks, all_vis, all_videos)):
+                    _save_track_vis(
+                        video[0],
+                        tracks[0].numpy(),
+                        vis[0].numpy(),
+                        os.path.join(debug_dir, f"tracks_cand{cand_idx:02d}.mp4"),
+                    )
+                del all_videos
+                torch.cuda.empty_cache()
+                log.info(f"Saved debug outputs to {debug_dir}")
 
                 # Select diverse subset
                 selected = greedy_diverse_select(D, next_size)
