@@ -38,6 +38,7 @@ dependencies = [
   "nvidia-ml-py",
   "prompt-toolkit>=3.0",
   "rich>=13.0",
+  "matplotlib",
 ]
 
 [build-system]
