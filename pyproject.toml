@@ -39,6 +39,7 @@ dependencies = [
   "prompt-toolkit>=3.0",
   "rich>=13.0",
   "matplotlib",
+  "setuptools",
 ]
 
 [build-system]

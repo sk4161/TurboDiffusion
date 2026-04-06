@@ -115,6 +115,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--ode", action="store_true", help="Use ODE for sampling (sharper but less robust than SDE)")
     parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility")
     parser.add_argument("--save_path", type=str, default="output/generated_video.mp4", help="Path to save the generated video (include file extension)")
+    parser.add_argument("--num_videos", type=int, default=1, help="Number of videos to generate with consecutive seeds (standard inference only)")
     parser.add_argument("--attention_type", choices=["sla", "sagesla", "original"], default="sagesla", help="Type of attention mechanism to use")
     parser.add_argument("--sla_topk", type=float, default=0.1, help="Top-k ratio for SLA/SageSLA attention")
     parser.add_argument("--quant_linear", action="store_true", help="Whether to replace Linear layers with quantized versions")
@@ -265,47 +266,63 @@ if __name__ == "__main__":
     # Standard (non-group) inference
     # =========================================================================
     if not args.group_inference:
-        generator = torch.Generator(device=tensor_kwargs["device"])
-        generator.manual_seed(args.seed)
+        os.makedirs(os.path.dirname(args.save_path) or ".", exist_ok=True)
 
-        init_noise = torch.randn(
-            args.num_samples, *state_shape,
-            dtype=torch.float32, device=tensor_kwargs["device"], generator=generator,
-        )
-        x = init_noise.to(torch.float64) * t_steps[0]
-        ones = torch.ones(x.size(0), 1, device=x.device, dtype=x.dtype)
+        for vid_idx in range(args.num_videos):
+            seed = args.seed + vid_idx
+            log.info(f"Generating video {vid_idx+1}/{args.num_videos} (seed={seed})")
 
-        high_noise_model.cuda()
-        net = high_noise_model
-        switched = False
-        for i, (t_cur, t_next) in enumerate(tqdm(list(zip(t_steps[:-1], t_steps[1:])), desc="Sampling", total=total_steps)):
-            if t_cur.item() < args.boundary and not switched:
-                high_noise_model.cpu()
-                torch.cuda.empty_cache()
-                low_noise_model.cuda()
-                net = low_noise_model
-                switched = True
-                log.info("Switched to low noise model.")
-            with torch.no_grad():
-                v_pred = net(x_B_C_T_H_W=x.to(**tensor_kwargs), timesteps_B_T=(t_cur.float() * ones * 1000).to(**tensor_kwargs), **condition).to(
-                    torch.float64
-                )
-                if args.ode:
-                    x = x - (t_cur - t_next) * v_pred
-                else:
-                    x = (1 - t_next) * (x - t_cur * v_pred) + t_next * torch.randn(
-                        *x.shape, dtype=torch.float32, device=tensor_kwargs["device"], generator=generator,
+            generator = torch.Generator(device=tensor_kwargs["device"])
+            generator.manual_seed(seed)
+
+            init_noise = torch.randn(
+                args.num_samples, *state_shape,
+                dtype=torch.float32, device=tensor_kwargs["device"], generator=generator,
+            )
+            x = init_noise.to(torch.float64) * t_steps[0]
+            ones = torch.ones(x.size(0), 1, device=x.device, dtype=x.dtype)
+
+            high_noise_model.cuda()
+            net = high_noise_model
+            switched = False
+            for i, (t_cur, t_next) in enumerate(tqdm(list(zip(t_steps[:-1], t_steps[1:])), desc=f"Sampling seed={seed}", total=total_steps)):
+                if t_cur.item() < args.boundary and not switched:
+                    high_noise_model.cpu()
+                    torch.cuda.empty_cache()
+                    low_noise_model.cuda()
+                    net = low_noise_model
+                    switched = True
+                    log.info("Switched to low noise model.")
+                with torch.no_grad():
+                    v_pred = net(x_B_C_T_H_W=x.to(**tensor_kwargs), timesteps_B_T=(t_cur.float() * ones * 1000).to(**tensor_kwargs), **condition).to(
+                        torch.float64
                     )
-        samples = x.float()
+                    if args.ode:
+                        x = x - (t_cur - t_next) * v_pred
+                    else:
+                        x = (1 - t_next) * (x - t_cur * v_pred) + t_next * torch.randn(
+                            *x.shape, dtype=torch.float32, device=tensor_kwargs["device"], generator=generator,
+                        )
+            samples = x.float()
+
+            with torch.no_grad():
+                video = tokenizer.decode(samples)
+
+            to_show = (1.0 + video.float().cpu().clamp(-1, 1)) / 2.0
+            if args.num_videos == 1:
+                save_path = args.save_path
+            else:
+                base, ext = os.path.splitext(args.save_path)
+                save_path = f"{base}_seed{seed}{ext}"
+            save_image_or_video(rearrange(to_show, "b c t h w -> c t h (b w)"), save_path, fps=16)
+            log.success(f"Saved to {save_path}")
+
+            del video, samples
+            torch.cuda.empty_cache()
+
+        high_noise_model.cpu()
         low_noise_model.cpu()
         torch.cuda.empty_cache()
-
-        with torch.no_grad():
-            video = tokenizer.decode(samples)
-
-        to_show = [(1.0 + video.float().cpu().clamp(-1, 1)) / 2.0]
-        to_show = torch.stack(to_show, dim=0)
-        save_image_or_video(rearrange(to_show, "n b c t h w -> c t (n h) (b w)"), args.save_path, fps=16)
 
     # =========================================================================
     # Group inference with trajectory diversity pruning
